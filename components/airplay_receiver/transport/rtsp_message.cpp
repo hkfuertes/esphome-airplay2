@@ -119,6 +119,27 @@ void rtsp_parse_transport(const char *request, uint16_t *control_port, uint16_t 
   }
 }
 
+bool rtsp_parse_active_remote(const char *request, char *out, size_t out_len) {
+  if (request == nullptr || out == nullptr || out_len == 0) {
+    return false;
+  }
+  const char *h = ci_strstr(request, "active-remote:");
+  if (h == nullptr) {
+    return false;
+  }
+  h += strlen("active-remote:");
+  while (*h == ' ' || *h == '\t') {
+    h++;
+  }
+  size_t i = 0;
+  while (h[i] != '\0' && h[i] != '\r' && h[i] != '\n' && i + 1 < out_len) {
+    out[i] = h[i];
+    i++;
+  }
+  out[i] = '\0';
+  return i > 0;
+}
+
 int rtsp_request_parse(const uint8_t *data, size_t len, RtspRequest *req) {
   if (data == nullptr || req == nullptr || len == 0) {
     return -1;

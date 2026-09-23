@@ -56,6 +56,11 @@ struct RtspConn {
   // AirPlay protocol version detected from request shape:
   //   0 = unknown, 1 = classic RAOP, 2 = AirPlay 2
   uint8_t protocol_version = 0;
+
+  // Sender's DACP identity (Active-Remote header, captured from any request).
+  // Non-empty arms the receiver->sender control channel (DACP on port 3689):
+  // play/pause/volume from the box then move the sender's own UI.
+  char active_remote[48] = {};
 };
 
 /**

@@ -6,6 +6,7 @@
 #include <string>
 
 #include "timing/ptp_clock.h"
+#include "transport/dacp.h"
 
 #include "esphome/components/network/util.h"
 
@@ -331,6 +332,67 @@ void AirPlayReceiver::control(const media_player::MediaPlayerCall &call) {
   if (!command.has_value()) {
     return;
   }
+
+  // ESP32 -> sender channel: with a live session that exposed an
+  // Active-Remote identity, drive the sender itself over DACP, so the phone's
+  // lock screen and volume slider follow the box. The sender confirms with
+  // its own events (PLAYING/PAUSED, SET_PARAMETER volume); volume is
+  // deliberately not stepped locally here -- the sender echoes the new level
+  // and TRANSPORT_EVENT_VOLUME mirrors it below. MUTE/UNMUTE stay local on
+  // purpose: they mute what is playing HERE (the phone-rings case), while
+  // DACP mute would change the sender for everyone listening.
+  DacpCommand dacp_cmd;
+  bool via_dacp = false;
+  switch (command.value()) {
+    case media_player::MEDIA_PLAYER_COMMAND_TOGGLE:
+      dacp_cmd = DacpCommand::PLAY_PAUSE;
+      via_dacp = true;
+      break;
+    case media_player::MEDIA_PLAYER_COMMAND_PLAY:
+      dacp_cmd = DacpCommand::PLAY;
+      via_dacp = true;
+      break;
+    case media_player::MEDIA_PLAYER_COMMAND_PAUSE:
+      dacp_cmd = DacpCommand::PAUSE;
+      via_dacp = true;
+      break;
+    case media_player::MEDIA_PLAYER_COMMAND_STOP:
+      dacp_cmd = DacpCommand::STOP;
+      via_dacp = true;
+      break;
+    case media_player::MEDIA_PLAYER_COMMAND_VOLUME_UP:
+      dacp_cmd = DacpCommand::VOLUME_UP;
+      via_dacp = true;
+      break;
+    case media_player::MEDIA_PLAYER_COMMAND_VOLUME_DOWN:
+      dacp_cmd = DacpCommand::VOLUME_DOWN;
+      via_dacp = true;
+      break;
+    default:
+      break;
+  }
+  if (via_dacp && dacp_send(dacp_cmd)) {
+    // Optimistic state; the sender's own events will correct it within a beat.
+    switch (command.value()) {
+      case media_player::MEDIA_PLAYER_COMMAND_PLAY:
+        this->desired_state_ = media_player::MEDIA_PLAYER_STATE_PLAYING;
+        this->state_dirty_ = true;
+        break;
+      case media_player::MEDIA_PLAYER_COMMAND_PAUSE:
+        this->desired_state_ = media_player::MEDIA_PLAYER_STATE_PAUSED;
+        this->state_dirty_ = true;
+        break;
+      case media_player::MEDIA_PLAYER_COMMAND_STOP:
+        this->desired_state_ = media_player::MEDIA_PLAYER_STATE_IDLE;
+        this->state_dirty_ = true;
+        break;
+      default:
+        break;
+    }
+    this->publish_state();
+    return;
+  }
+
   bool playing;
   switch (command.value()) {
     case media_player::MEDIA_PLAYER_COMMAND_TOGGLE:
@@ -387,6 +449,9 @@ void AirPlayReceiver::control(const media_player::MediaPlayerCall &call) {
     default:
       break;
   }
+  // Apply desired_state_ on the next loop() pass. Without this, the local
+  // (no-session) path set desired_state_ but nothing ever published it.
+  this->state_dirty_ = true;
   this->publish_state();
 }
 
@@ -469,9 +534,15 @@ void AirPlayReceiver::handle_transport_event(TransportEvent event, const Transpo
       this->desired_state_ = media_player::MEDIA_PLAYER_STATE_PAUSED;
       this->state_dirty_ = true;
       break;
-    case TRANSPORT_EVENT_VOLUME:
+    case TRANSPORT_EVENT_VOLUME: {
       audio_output_set_volume_q15(transport_volume_q15());
+      // Mirror the sender's level into the entity: this is how DACP volume
+      // steps and sender-side slider moves reach the HA card. Q15: 32768 = 1.0.
+      this->volume = static_cast<float>(transport_volume_q15()) / 32768.0f;
+      this->cached_volume_ = this->volume;
+      this->state_dirty_ = true;
       break;
+    }
     case TRANSPORT_EVENT_DISCONNECTED:
       ESP_LOGI(TAG, "audio: DISCONNECTED");
       audio_receiver_stop();

@@ -2,8 +2,9 @@
 #
 # Three momentary buttons to ground, on an Amped-ESP32-S3 alongside the DAC
 # pins. Pressing play/pause on the box does the same thing as pressing it in
-# Control Center: the command goes back to the sender over RTSP, so the phone's
-# lock screen follows along.
+# Control Center: with a sender session live the command goes back to the
+# phone over DACP (its port 3689, armed by the Active-Remote header it sent
+# us), so the lock screen follows along.
 #
 # Volume repeats while held rather than stepping once per press, which is what
 # anyone who has used a physical volume button expects.

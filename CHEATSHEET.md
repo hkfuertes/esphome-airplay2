@@ -142,7 +142,8 @@ cd .check && esphome compile amped-s3.yaml
   setup/loop, transport-event handling (incl. the METADATA → track-title wiring), media_player callbacks.
 - `transport/` — RTSP server/control + Bonjour/mDNS glue + binary-plist + sockets. The sender's
   timing/control ports are captured in SETUP; PTP is started at SETPEERS **and** belt-and-braces at
-  stream SETUP / RECORD.
+  stream SETUP / RECORD. `transport/dacp.{h,cpp}` is the reverse channel: a mini DACP client that
+  drives the sender's own control server on port 3689 (see below).
 - `crypto/` — HomeKit pairing (SRP-6a + Ed25519 + ChaCha20-Poly1305) + audio decrypt.
 - `timing/` — PTP one-sample clock servo + NTP client (`ptp_clock`, `ntp_clock`, `audio_timing`).
 - `decoder/` — ALAC/AAC decode via `espressif/esp_audio_codec` (managed component; impl headers resolve from the managed include dirs, do not create local shadow copies).
@@ -170,6 +171,18 @@ void airplay_audio_set_track_title(const char *title);
 ```
 The RTSP `TRANSPORT_EVENT_METADATA` handler calls `airplay_audio_set_track_title()` (this ESPHome
 media_player has no title/artist fields, so the title is held here and logged).
+
+## ESP32 -> sender control (DACP, `transport/dacp.{h,cpp}`)
+A sender that puts `Active-Remote` on its RTSP requests (iOS/macOS always do) is running a DACP
+server on port 3689. The receiver captures the header (first request, headers-only buffer in
+`process_rtsp_buffer`), remembers the endpoint, and forwards media_player commands to it:
+`toggle/play/pause/stop/volume_up/volume_down` become `GET /ctrl-int/1/<cmd>` on a dedicated task
+(queue depth 4, non-blocking connect, 1.5 s timeout — a vanished phone cannot wedge anything).
+No session, or DACP unavailable -> the same commands fall back to local behaviour. Volume is
+blind-stepped on the sender and converges via its `SET_PARAMETER` echo, which
+`TRANSPORT_EVENT_VOLUME` mirrors into the entity. MUTE/UNMUTE stay local by design. The endpoint is
+cleared only on a real disconnect — never on a superseded-slot cleanup, same rule as the
+`DISCONNECTED` guard (FIELD-NOTES failure 2).
 
 ## Pitfalls / gotchas (already handled, don't regress)
 - **`api:` must not enable `encryption:`.** It pulls `esphome/noise-c`, which brings its own

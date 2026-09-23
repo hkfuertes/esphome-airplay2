@@ -4,6 +4,8 @@
 // AirPlay 2 control methods, drives the CryptoModule for PAIR-SETUP/PAIR-VERIFY,
 // and hands fully-configured streams to the audio engine via transport events.
 #include "transport_module.h"
+#include "dacp.h"
+#include "rtsp_message.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -333,6 +335,14 @@ static void process_rtsp_buffer(ClientSlot *slot, uint8_t *buffer, size_t *buf_l
     // Null-terminate the message boundary so header parsers cannot over-read.
     uint8_t saved = buffer[total_len];
     buffer[total_len] = '\0';
+    // Arm the ESP32->sender control channel the first time the sender shows
+    // its DACP identity. header_str is the headers-only NUL-terminated view,
+    // so the search cannot wander into a binary body.
+    if (slot->conn->active_remote[0] == '\0' &&
+        rtsp_parse_active_remote(header_str, slot->conn->active_remote, sizeof(slot->conn->active_remote))) {
+      dacp_session_set(slot->conn->client_ip, slot->conn->active_remote);
+      ESP_LOGI(TAG, "DACP sender armed (Active-Remote: %s)", slot->conn->active_remote);
+    }
     rtsp_dispatch(slot->socket, slot->conn, buffer, total_len);
     buffer[total_len] = saved;
     airplay_free(header_str);
@@ -489,6 +499,11 @@ cleanup:
   if (!superseded) {
     transport_events_emit(TRANSPORT_EVENT_DISCONNECTED, nullptr);
     stop_event_port_task();
+    // The sender really went away: drop its DACP endpoint too. A superseded
+    // task must NOT clear -- its cleanup can land after the replacement
+    // session already armed the channel (same rule as the DISCONNECTED guard
+    // above; see FIELD-NOTES failure 2).
+    dacp_session_clear();
   }
 
   rtsp_conn_free(conn);
