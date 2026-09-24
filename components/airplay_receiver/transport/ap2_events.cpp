@@ -18,6 +18,7 @@
 
 #include "esp_mac.h"
 #include "esp_random.h"
+#include "esp_timer.h"
 #include "esphome/core/log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -41,6 +42,7 @@ constexpr UBaseType_t AP2_QUEUE_LEN = 8;
 constexpr uint32_t AP2_ACCEPT_POLL_MS = 50;
 constexpr uint32_t AP2_IDLE_POLL_MS = 20;
 constexpr uint32_t AP2_IO_TIMEOUT_S = 2;
+constexpr int64_t AP2_IO_TIMEOUT_US = static_cast<int64_t>(AP2_IO_TIMEOUT_S) * 1000000;
 constexpr uint32_t AP2_STOP_TIMEOUT_MS = 2500;
 constexpr uint32_t AP2_TASK_STACK = 8192;
 
@@ -155,7 +157,7 @@ bool parse_reply_header(char *header, int *status, size_t *body_len) {
 
 // Read and fully drain one encrypted reply. A later command must never consume
 // a response that belonged to an earlier command, or the nonce stream desyncs.
-bool read_reply(int socket, RtspConn *cipher, int *status) {
+bool read_reply(int socket, RtspConn *cipher, int *status, int64_t deadline_us) {
   char header[AP2_REPLY_HEADER_MAX] = {};
   size_t header_len = 0;
   size_t body_remaining = 0;
@@ -163,7 +165,7 @@ bool read_reply(int socket, RtspConn *cipher, int *status) {
 
   for (;;) {
     uint8_t block[AIRPLAY_RTSP_ENCRYPTED_BLOCK_MAX];
-    const int received = rtsp_crypto_read_block(socket, cipher, block, sizeof(block));
+    const int received = rtsp_crypto_read_block_until(socket, cipher, block, sizeof(block), deadline_us);
     if (received <= 0) {
       return false;
     }
@@ -223,7 +225,8 @@ bool post_command(int socket, RtspConn *cipher, const uint8_t *body, size_t body
   }
   std::memcpy(message, header, static_cast<size_t>(header_len));
   std::memcpy(message + header_len, body, body_len);
-  const bool wrote = rtsp_crypto_write_frame(socket, cipher, message, message_len) == 0;
+  const int64_t deadline_us = esp_timer_get_time() + AP2_IO_TIMEOUT_US;
+  const bool wrote = rtsp_crypto_write_frame_until(socket, cipher, message, message_len, deadline_us) == 0;
   airplay_free(message);
   if (!wrote) {
     ESP_LOGW(TAG, "AP2 %s send failed", kind);
@@ -231,7 +234,7 @@ bool post_command(int socket, RtspConn *cipher, const uint8_t *body, size_t body
   }
 
   int status = 0;
-  if (!read_reply(socket, cipher, &status)) {
+  if (!read_reply(socket, cipher, &status, deadline_us)) {
     ESP_LOGW(TAG, "AP2 %s failed (closed, invalid reply or timeout)", kind);
     return false;
   }
@@ -302,6 +305,8 @@ void ap2_events_task(void *) {
   cipher.encrypted_mode = true;
   int client = -1;
 
+  ESP_LOGI(TAG, "AP2 event listener waiting for peer=%08lx",
+           static_cast<unsigned long>(ntohl(peer_ip)));
   while (!is_stopping() && listener >= 0) {
     sockaddr_in address{};
     socklen_t address_len = sizeof(address);
@@ -314,10 +319,16 @@ void ap2_events_task(void *) {
       ESP_LOGW(TAG, "Event accept failed: %d", errno);
       break;
     }
+    const unsigned long actual_peer = static_cast<unsigned long>(ntohl(address.sin_addr.s_addr));
+    const unsigned long expected_peer = static_cast<unsigned long>(ntohl(peer_ip));
     if (address.sin_addr.s_addr != peer_ip) {
+      ESP_LOGW(TAG, "AP2 event peer rejected: got=%08lx expected=%08lx", actual_peer, expected_peer);
       close(client);
       client = -1;
+      continue;
     }
+    ESP_LOGI(TAG, "AP2 event peer accepted: %08lx", actual_peer);
+    break;  // Hand this socket to updateInfo instead of accepting another peer.
   }
   if (listener >= 0) {
     close(listener);
