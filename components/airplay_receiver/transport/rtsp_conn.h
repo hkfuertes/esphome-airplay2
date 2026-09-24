@@ -36,8 +36,8 @@ struct RtspConn {
   uint16_t data_port = 0;              // UDP port for audio data
   uint16_t control_port = 0;           // UDP control (retransmit) port
   uint16_t timing_port = 0;            // timing port
-  uint16_t event_port = 0;             // TCP server->client event port
-  int event_socket = -1;               // TCP listener fd for the event port
+  uint16_t event_port = 0;             // TCP listener for AP2 reverse events
+  int event_socket = -1;               // temporary listener; worker owns it after start
   uint16_t buffered_port = 0;          // TCP port for buffered audio
   uint16_t client_control_port = 0;    // client control port (from SETUP)
   uint16_t client_timing_port = 0;     // client timing port (AirPlay 1)
@@ -56,6 +56,10 @@ struct RtspConn {
   // AirPlay protocol version detected from request shape:
   //   0 = unknown, 1 = classic RAOP, 2 = AirPlay 2
   uint8_t protocol_version = 0;
+
+  // Legacy sender DACP identity (Active-Remote, captured from any request).
+  // Modern encrypted senders use the AP2 event channel instead.
+  char active_remote[48] = {};
 };
 
 /**

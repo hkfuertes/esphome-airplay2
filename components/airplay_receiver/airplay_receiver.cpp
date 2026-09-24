@@ -6,6 +6,8 @@
 #include <string>
 
 #include "timing/ptp_clock.h"
+#include "transport/ap2_events.h"
+#include "transport/dacp.h"
 
 #include "esphome/components/network/util.h"
 
@@ -15,6 +17,21 @@ namespace esphome {
 namespace airplay_receiver {
 
 static const char *const TAG = "airplay_receiver";
+constexpr float AIRPLAY_MIN_VOLUME_DB = -30.0f;
+constexpr float AIRPLAY_MAX_VOLUME_DB = 0.0f;
+
+uint8_t media_player_volume_to_audio_percent(float level) {
+  const float clamped = std::clamp(level, 0.0f, 1.0f);
+  return static_cast<uint8_t>(std::round(clamped * clamped * 100.0f));
+}
+
+float airplay_db_to_media_player_volume(float volume_db) {
+  if (!std::isfinite(volume_db)) {
+    return 0.0f;
+  }
+  return std::clamp((volume_db - AIRPLAY_MIN_VOLUME_DB) / (AIRPLAY_MAX_VOLUME_DB - AIRPLAY_MIN_VOLUME_DB), 0.0f,
+                    1.0f);
+}
 
 void AirPlayReceiver::setup() {
   // The entity name (config `name:`, from the media_player schema) is the user
@@ -318,19 +335,38 @@ media_player::MediaPlayerTraits AirPlayReceiver::get_traits() {
 }
 
 void AirPlayReceiver::control(const media_player::MediaPlayerCall &call) {
-  // Ha volume (0.0-1.0) -> audio engine percent (0-100).
+  // HA volume is AirPlay's normalized -30..0 dB slider; map it to Q15 percent.
   if (auto volume = call.get_volume(); volume.has_value()) {
-    uint8_t vol_pct = static_cast<uint8_t>(std::round(volume.value() * 100.0f));
-    airplay_audio_set_volume(vol_pct);
-    this->volume = volume.value();
-    this->cached_volume_ = this->volume;
-    this->publish_state();
+    if (std::isfinite(volume.value())) {
+      const float local_volume = std::clamp(volume.value(), 0.0f, 1.0f);
+      airplay_audio_set_volume(media_player_volume_to_audio_percent(local_volume));
+      this->volume = local_volume;
+      this->cached_volume_ = this->volume;
+      this->publish_state();
+
+      // Modern iOS receives dvlc on the encrypted AP2 event channel. Retain
+      // DACP's Shairport-compatible dB endpoint for legacy senders only.
+      if (!ap2_events_volume(local_volume)) {
+        dacp_set_volume(AIRPLAY_MIN_VOLUME_DB +
+                        (AIRPLAY_MAX_VOLUME_DB - AIRPLAY_MIN_VOLUME_DB) * local_volume);
+      }
+    } else {
+      ESP_LOGW(TAG, "Ignoring non-finite media-player volume");
+    }
   }
 
   auto command = call.get_command();
   if (!command.has_value()) {
     return;
   }
+
+  // AP2 reverse events are primary; DACP is a legacy fallback. Do not predict
+  // state after queuing a toggle: the sender's RTSP event is authoritative.
+  if (command.value() == media_player::MEDIA_PLAYER_COMMAND_TOGGLE &&
+      (ap2_events_play_pause() || dacp_send(DacpCommand::PLAY_PAUSE))) {
+    return;
+  }
+
   bool playing;
   switch (command.value()) {
     case media_player::MEDIA_PLAYER_COMMAND_TOGGLE:
@@ -361,20 +397,26 @@ void AirPlayReceiver::control(const media_player::MediaPlayerCall &call) {
       break;
     case media_player::MEDIA_PLAYER_COMMAND_UNMUTE:
       this->muted_ = false;
-      airplay_audio_set_volume(static_cast<uint8_t>(std::round(this->cached_volume_ * 100.0f)));
+      airplay_audio_set_volume(media_player_volume_to_audio_percent(this->cached_volume_));
       break;
     case media_player::MEDIA_PLAYER_COMMAND_VOLUME_UP: {
       float v = std::min(1.0f, this->volume + 0.05f);
-      airplay_audio_set_volume(static_cast<uint8_t>(std::round(v * 100.0f)));
+      airplay_audio_set_volume(media_player_volume_to_audio_percent(v));
       this->volume = v;
       this->cached_volume_ = v;
+      if (!ap2_events_volume(v)) {
+        dacp_send(DacpCommand::VOLUME_UP);
+      }
       break;
     }
     case media_player::MEDIA_PLAYER_COMMAND_VOLUME_DOWN: {
       float v = std::max(0.0f, this->volume - 0.05f);
-      airplay_audio_set_volume(static_cast<uint8_t>(std::round(v * 100.0f)));
+      airplay_audio_set_volume(media_player_volume_to_audio_percent(v));
       this->volume = v;
       this->cached_volume_ = v;
+      if (!ap2_events_volume(v)) {
+        dacp_send(DacpCommand::VOLUME_DOWN);
+      }
       break;
     }
     case media_player::MEDIA_PLAYER_COMMAND_TURN_ON:
@@ -387,6 +429,9 @@ void AirPlayReceiver::control(const media_player::MediaPlayerCall &call) {
     default:
       break;
   }
+  // Apply desired_state_ on the next loop() pass. Without this, the local
+  // (no-session) path set desired_state_ but nothing ever published it.
+  this->state_dirty_ = true;
   this->publish_state();
 }
 
@@ -469,9 +514,15 @@ void AirPlayReceiver::handle_transport_event(TransportEvent event, const Transpo
       this->desired_state_ = media_player::MEDIA_PLAYER_STATE_PAUSED;
       this->state_dirty_ = true;
       break;
-    case TRANSPORT_EVENT_VOLUME:
+    case TRANSPORT_EVENT_VOLUME: {
       audio_output_set_volume_q15(transport_volume_q15());
+      // Mirror AirPlay's -30..0 dB slider into HA. Q15 is the audio gain
+      // curve, not the sender's UI scale.
+      this->volume = airplay_db_to_media_player_volume(transport_volume_db());
+      this->cached_volume_ = this->volume;
+      this->state_dirty_ = true;
       break;
+    }
     case TRANSPORT_EVENT_DISCONNECTED:
       ESP_LOGI(TAG, "audio: DISCONNECTED");
       audio_receiver_stop();

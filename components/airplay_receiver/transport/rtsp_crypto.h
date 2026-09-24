@@ -26,11 +26,23 @@ namespace airplay_receiver {
 int rtsp_crypto_read_block(int socket, RtspConn *conn, uint8_t *buffer, size_t buffer_size);
 
 /**
+ * Read one block, but fail when the absolute esp_timer deadline (microseconds)
+ * expires. AP2 reverse events use this so a missing reply cannot wedge their
+ * independent cipher stream forever.
+ */
+int rtsp_crypto_read_block_until(int socket, RtspConn *conn, uint8_t *buffer, size_t buffer_size,
+                                 int64_t deadline_us);
+
+/**
  * Encrypt and write `data` to the socket, splitting into blocks of at most
  * AIRPLAY_RTSP_ENCRYPTED_BLOCK_MAX plaintext bytes each.
  * @return 0 on success, -1 on error.
  */
 int rtsp_crypto_write_frame(int socket, RtspConn *conn, const uint8_t *data, size_t data_len);
+
+/** Write one frame with an absolute esp_timer deadline (microseconds). */
+int rtsp_crypto_write_frame_until(int socket, RtspConn *conn, const uint8_t *data, size_t data_len,
+                                  int64_t deadline_us);
 
 }  // namespace airplay_receiver
 }  // namespace esphome

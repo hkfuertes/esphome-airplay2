@@ -142,7 +142,8 @@ cd .check && esphome compile amped-s3.yaml
   setup/loop, transport-event handling (incl. the METADATA → track-title wiring), media_player callbacks.
 - `transport/` — RTSP server/control + Bonjour/mDNS glue + binary-plist + sockets. The sender's
   timing/control ports are captured in SETUP; PTP is started at SETPEERS **and** belt-and-braces at
-  stream SETUP / RECORD.
+  stream SETUP / RECORD. `transport/ap2_events.{h,cpp}` is the encrypted modern reverse channel;
+  `transport/dacp.{h,cpp}` remains its legacy fallback (see below).
 - `crypto/` — HomeKit pairing (SRP-6a + Ed25519 + ChaCha20-Poly1305) + audio decrypt.
 - `timing/` — PTP one-sample clock servo + NTP client (`ptp_clock`, `ntp_clock`, `audio_timing`).
 - `decoder/` — ALAC/AAC decode via `espressif/esp_audio_codec` (managed component; impl headers resolve from the managed include dirs, do not create local shadow copies).
@@ -170,6 +171,21 @@ void airplay_audio_set_track_title(const char *title);
 ```
 The RTSP `TRANSPORT_EVENT_METADATA` handler calls `airplay_audio_set_track_title()` (this ESPHome
 media_player has no title/artist fields, so the title is held here and logged).
+
+## ESP32 -> sender control (AP2 events, DACP fallback)
+Modern encrypted iPhones can omit both `DACP-ID` and `Active-Remote`, so the primary reverse path is
+`transport/ap2_events.{h,cpp}`. Initial SETUP captures `groupUUID`, hands its listener to the AP2
+worker, and only accepts the original RTSP peer. It derives a distinct event HAP session with
+`Events-Write`/`Events-Read` keys (using all 64 transient-SRP bytes), sends encrypted `updateInfo`,
+and serializes up to eight `/command` requests: `modernMediaRemoteCommand=2` for toggle and `dvlc`
+for 0..1 absolute volume. Each reply is fully drained before the next request so the cipher nonce
+streams stay synchronized. Volume always changes local output first; sender RTSP events converge
+`TRANSPORT_EVENT_VOLUME` and playback state back into the entity.
+
+`transport/dacp.{h,cpp}` remains a best-effort fallback only when a sender supplies `Active-Remote`:
+its depth-eight task sends `GET /ctrl-int/1/<cmd>` to port 3689, including the Shairport-compatible
+`setproperty?dmcp.device-volume=<dB>` endpoint. Both reverse paths leave explicit play/pause/stop
+and MUTE/UNMUTE local. A real disconnect clears/stops them; a superseded slot must do neither.
 
 ## Pitfalls / gotchas (already handled, don't regress)
 - **`api:` must not enable `encryption:`.** It pulls `esphome/noise-c`, which brings its own

@@ -2,6 +2,8 @@
 #include <string.h>
 #include <cstdint>
 #include <cstddef>
+#include <cmath>
+#include <initializer_list>
 
 #include "bplist.h"
 
@@ -143,11 +145,15 @@ static bool bplist_write_length(uint8_t *out, size_t capacity, size_t *pos,
     out[(*pos)++] = marker_base | (uint8_t)length;
     return true;
   }
-  if (length > UINT8_MAX || !bplist_has_room(*pos, 3, capacity)) {
+  if (length > UINT16_MAX ||
+      !bplist_has_room(*pos, length <= UINT8_MAX ? 3 : 4, capacity)) {
     return false;
   }
   out[(*pos)++] = marker_base | 0x0F;
-  out[(*pos)++] = 0x10;
+  out[(*pos)++] = length <= UINT8_MAX ? 0x10 : 0x11;
+  if (length > UINT8_MAX) {
+    out[(*pos)++] = (uint8_t)(length >> 8);
+  }
   out[(*pos)++] = (uint8_t)length;
   return true;
 }
@@ -253,6 +259,134 @@ static bool bplist_finish(uint8_t *out, size_t capacity, size_t *pos,
     return false;
   }
   return true;
+}
+
+// Small AP2 reverse-event object graphs from Shairport Sync (Mike Brady,
+// 2025--2026) via shairport-echo patch 0008. Retained permission notice:
+// licenses/shairport-events.txt.
+namespace {
+struct EventPlist {
+  uint8_t *out;
+  size_t capacity;
+  size_t pos = 8;
+  size_t offsets[64]{};
+  size_t count = 0;
+  bool ok;
+
+  EventPlist(uint8_t *buffer, size_t size) : out(buffer), capacity(size), ok(buffer && size >= 8) {
+    if (ok) {
+      memcpy(out, "bplist00", 8);
+    }
+  }
+  template<typename Writer> uint8_t add(Writer write) {
+    if (!ok || count == 64) {
+      ok = false;
+      return 0;
+    }
+    const uint8_t id = count++;
+    offsets[id] = pos;
+    ok = write();
+    return id;
+  }
+  uint8_t string(const char *text) {
+    return add([&] { return text && bplist_write_ascii_string(out, capacity, &pos, text); });
+  }
+  uint8_t integer(uint64_t number) {
+    return add([&] { return bplist_write_int(out, capacity, &pos, number); });
+  }
+  uint8_t real(double number) {
+    return add([&] {
+      uint64_t bits;
+      memcpy(&bits, &number, sizeof(bits));
+      if (!bplist_has_room(pos, 9, capacity)) {
+        return false;
+      }
+      out[pos++] = 0x23;
+      return bplist_write_u64(out, capacity, &pos, bits);
+    });
+  }
+  uint8_t boolean(bool value) {
+    return add([&] {
+      if (!bplist_has_room(pos, 1, capacity)) {
+        return false;
+      }
+      out[pos++] = value ? 0x09 : 0x08;
+      return true;
+    });
+  }
+  uint8_t data(const uint8_t *bytes, size_t size) {
+    return add([&] { return bplist_write_data(out, capacity, &pos, bytes, size); });
+  }
+  uint8_t array(std::initializer_list<uint8_t> refs) {
+    return add([&] { return bplist_write_array(out, capacity, &pos, refs.begin(), refs.size()); });
+  }
+  uint8_t dict(std::initializer_list<uint8_t> keys, std::initializer_list<uint8_t> values) {
+    return add([&] {
+      return keys.size() == values.size() &&
+             bplist_write_dict(out, capacity, &pos, keys.begin(), values.begin(), keys.size());
+    });
+  }
+  size_t finish(uint8_t root) {
+    return ok && bplist_finish(out, capacity, &pos, offsets, count, root) ? pos : 0;
+  }
+};
+
+size_t event_destination_archive(uint8_t *out, size_t capacity, const char *group_id) {
+  EventPlist p(out, capacity);
+  const auto version_key = p.string("$version"), archiver_key = p.string("$archiver");
+  const auto top_key = p.string("$top"), objects_key = p.string("$objects");
+  const auto version = p.integer(100000), archiver = p.string("NSKeyedArchiver");
+  const auto root_key = p.string("root"), uid_key = p.string("CF$UID");
+  const auto one = p.integer(1), two = p.integer(2), three = p.integer(3);
+  const auto root_uid = p.dict({uid_key}, {one});
+  const auto top = p.dict({root_key}, {root_uid});
+  const auto null_value = p.string("$null"), group = p.string(group_id);
+  const auto ns_objects = p.string("NS.objects"), ns_class = p.string("$class");
+  const auto element_uid = p.dict({uid_key}, {two}), class_uid = p.dict({uid_key}, {three});
+  const auto values = p.array({element_uid});
+  const auto array_object = p.dict({ns_objects, ns_class}, {values, class_uid});
+  const auto classname = p.string("$classname"), classes = p.string("$classes");
+  const auto mutable_array = p.string("NSMutableArray"), array = p.string("NSArray");
+  const auto object = p.string("NSObject");
+  const auto class_list = p.array({mutable_array, array, object});
+  const auto class_definition = p.dict({classname, classes}, {mutable_array, class_list});
+  const auto objects = p.array({null_value, array_object, group, class_definition});
+  return p.finish(p.dict({version_key, archiver_key, top_key, objects_key}, {version, archiver, top, objects}));
+}
+}  // namespace
+
+size_t bplist_build_event_command(uint8_t *out, size_t capacity, const char *group_id, const char *command_id) {
+  if (!group_id || !*group_id || strlen(group_id) > 64 || !command_id || strlen(command_id) != 36) {
+    return 0;
+  }
+  uint8_t archive[768];
+  const size_t archive_size = event_destination_archive(archive, sizeof(archive), group_id);
+  if (!archive_size) {
+    return 0;
+  }
+  EventPlist p(out, capacity);
+  const auto type = p.string("type"), command_type = p.string("sendMediaRemoteCommand");
+  const auto modern = p.string("modernMediaRemoteCommand"), command = p.string("2");
+  const auto params_key = p.string("params");
+  const auto options = p.string("kMRMediaRemoteOptionSendOptionsNumber"), zero = p.integer(0);
+  const auto id_key = p.string("kMRMediaRemoteOptionCommandID"), id = p.string(command_id);
+  const auto redirect = p.string("kMRMediaRemoteOptionIsRedirectingCommand"), yes = p.boolean(true);
+  const auto destinations = p.string("kMRMediaRemoteOptionDestinationDeviceUIDs");
+  const auto data = p.data(archive, archive_size);
+  const auto params = p.dict({options, id_key, redirect, destinations}, {zero, id, yes, data});
+  return p.finish(p.dict({type, modern, params_key}, {command_type, command, params}));
+}
+
+size_t bplist_build_event_volume(uint8_t *out, size_t capacity, double volume) {
+  if (!std::isfinite(volume) || volume < 0 || volume > 1) {
+    return 0;
+  }
+  EventPlist p(out, capacity);
+  const auto type = p.string("type"), command_type = p.string("sendMediaRemoteCommand");
+  const auto value = p.string("value"), dvlc = p.string("dvlc");
+  const auto volume_key = p.string("volume"), level = p.real(volume);
+  const auto params_key = p.string("params"), params = p.dict({volume_key}, {level});
+  return p.finish(p.dict({type, value, volume_key, params_key}, {command_type, dvlc, level, params}));
 }
 
 size_t bplist_build_initial_setup(uint8_t *out, size_t capacity,
@@ -563,14 +697,14 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
                                   const char *device_name,
                                   const uint8_t *public_key,
                                   size_t public_key_len, uint64_t features,
-                                  int64_t protocol_version) {
+                                  int64_t protocol_version, const char *event_group) {
   if (!out || !device_id || !device_name || !public_key ||
       public_key_len == 0 || capacity < 512) {
     return 0;
   }
 
   size_t pos = 0;
-  size_t offsets[39];
+  size_t offsets[45];
   size_t obj = 0;
 
 #define ADD_OFFSET()                                   \
@@ -767,10 +901,41 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
     }
   }
 
+  if (event_group != nullptr) {
+    // ponytail: retain the ordinary /info graph, then wrap it with only gid.
+    ADD_OFFSET(); // 39: gid
+    if (!bplist_write_ascii_string(out, capacity, &pos, "gid")) {
+      return 0;
+    }
+    ADD_OFFSET(); // 40: session group
+    if (!bplist_write_ascii_string(out, capacity, &pos, event_group)) {
+      return 0;
+    }
+    ADD_OFFSET(); // 41: info with group
+    const uint8_t keys[] = {0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 28, 39};
+    const uint8_t values[] = {1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 27, 37, 40};
+    if (!bplist_write_dict(out, capacity, &pos, keys, values, 13)) {
+      return 0;
+    }
+    ADD_OFFSET(); // 42: updateInfo
+    if (!bplist_write_ascii_string(out, capacity, &pos, "updateInfo")) {
+      return 0;
+    }
+    ADD_OFFSET(); // 43: value
+    if (!bplist_write_ascii_string(out, capacity, &pos, "value")) {
+      return 0;
+    }
+    ADD_OFFSET(); // 44: reverse-event envelope
+    const uint8_t event_keys[] = {21, 43};
+    const uint8_t event_values[] = {42, 41};
+    if (!bplist_write_dict(out, capacity, &pos, event_keys, event_values, 2)) {
+      return 0;
+    }
+  }
+
 #undef ADD_OFFSET
 
-  if (obj != sizeof(offsets) / sizeof(offsets[0]) ||
-      !bplist_finish(out, capacity, &pos, offsets, obj, 38)) {
+  if (!bplist_finish(out, capacity, &pos, offsets, obj, obj - 1)) {
     return 0;
   }
 

@@ -44,6 +44,9 @@ int rtsp_request_parse(const uint8_t *data, size_t len, RtspRequest *req);
 int rtsp_parse_cseq(const char *request);
 /// Find/parse Content-Length (defaults to 0).
 int rtsp_parse_content_length(const char *request);
+/// Extract the Active-Remote header (sender's DACP identity), case-insensitive.
+/// Returns false (and leaves `out` untouched) when the header is absent.
+bool rtsp_parse_active_remote(const char *request, char *out, size_t out_len);
 /// Locate the body (returns pointer + length) after the header terminator.
 const uint8_t *rtsp_get_body(const char *request, size_t request_len, size_t *body_len);
 

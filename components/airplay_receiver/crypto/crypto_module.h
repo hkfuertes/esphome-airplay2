@@ -132,6 +132,9 @@ class CryptoModule {
 
   // --- session lifecycle ---------------------------------------------------
   HAPSession *create_session();
+  /// Create an independent AirPlay 2 event-channel cipher from an established
+  /// RTSP session. Its keys and nonce counters never share RTSP state.
+  HAPSession *create_event_session(const HAPSession *parent);
   void free_session(HAPSession *session);
 
   // --- pair-verify (AirPlay 2 transient pairing, TLV8) ------------------------

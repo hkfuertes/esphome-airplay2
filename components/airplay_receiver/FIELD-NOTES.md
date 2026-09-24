@@ -62,8 +62,8 @@ shuts the dead socket down **without waiting**, then immediately creates the new
 client task. Both now run. The new one completes SETUP/RECORD and starts audio;
 the old one wakes, reaches `cleanup:`, and emits `TRANSPORT_EVENT_DISCONNECTED`
 -- which calls `audio_receiver_stop()` and `audio_output_stop()` on the session
-that just replaced it, and `stop_event_port_task()` closes the event port it
-just opened.
+that just replaced it, and `ap2_events_stop()` closes the encrypted event port
+it just opened.
 
 `slot->should_stop` distinguishes the cases: set by the server task when the
 slot is superseded, clear when the sender itself went away. Only the latter may
