@@ -1,19 +1,13 @@
 #pragma once
 // airplay_receiver ESP32 -> sender control channel (DACP).
 //
-// A sender that puts an Active-Remote header on its RTSP requests is running a
-// DACP (Digital Audio Control Protocol) server on port 3689. The receiver can
-// drive it back: `GET /ctrl-int/1/<command>` with the Active-Remote value
-// echoed as a request header. This is what makes a button on the box move the
-// phone's own lock-screen state and volume slider, instead of only touching
-// the local output.
-//
-// ponytail: sender address = the RTSP peer IP + fixed port 3689 (what iOS and
-// macOS listen on); an mDNS browse of _dacp._tcp only matters for exotic
-// relays. Volume steps are blind (volumeup/volumedown); absolute volume uses
-// Shairport's proven setproperty?dmcp.device-volume=<dB> path. The sender
-// echoes the resulting level back over SET_PARAMETER volume, so the local
-// entity converges without a round-trip query.
+// Legacy fallback for a sender that puts Active-Remote on RTSP requests and
+// runs DACP (Digital Audio Control Protocol) on port 3689. Modern encrypted
+// iPhones use transport/ap2_events instead; do not assume these headers exist.
+// When present, requests are `GET /ctrl-int/1/<command>` with Active-Remote
+// echoed as a request header. Volume steps are blind; absolute volume uses
+// Shairport's setproperty?dmcp.device-volume=<dB> path and converges through
+// the sender's SET_PARAMETER volume event.
 
 #include <cstddef>
 #include <cstdint>

@@ -558,6 +558,41 @@ HAPSession *CryptoModule::create_session() {
   return session;
 }
 
+HAPSession *CryptoModule::create_event_session(const HAPSession *parent) {
+  if (parent == nullptr || !parent->session_established) {
+    return nullptr;
+  }
+
+  // Transient SRP pairing keeps the 64-byte K in its SRP state. The RTSP
+  // shared_secret intentionally holds only its first 32 bytes for legacy audio
+  // paths, but Events-* HKDF must consume the complete K.
+  const uint8_t *secret = parent->shared_secret;
+  size_t secret_len = sizeof(parent->shared_secret);
+  if (parent->pair_setup_transient) {
+    if (parent->srp == nullptr || !parent->srp->verified ||
+        parent->srp->session_key_len != SRP_SESSION_KEY_BYTES) {
+      return nullptr;
+    }
+    secret = parent->srp->session_key;
+    secret_len = parent->srp->session_key_len;
+  }
+
+  HAPSession *event = static_cast<HAPSession *>(airplay_calloc(1, sizeof(HAPSession), false));
+  if (event == nullptr) {
+    return nullptr;
+  }
+  hap_hkdf_sha512(reinterpret_cast<const uint8_t *>("Events-Salt"), 11, secret, secret_len,
+                  reinterpret_cast<const uint8_t *>("Events-Write-Encryption-Key"), 27,
+                  event->encrypt_key, sizeof(event->encrypt_key));
+  hap_hkdf_sha512(reinterpret_cast<const uint8_t *>("Events-Salt"), 11, secret, secret_len,
+                  reinterpret_cast<const uint8_t *>("Events-Read-Encryption-Key"), 26,
+                  event->decrypt_key, sizeof(event->decrypt_key));
+  event->encrypt_nonce = 0;
+  event->decrypt_nonce = 0;
+  event->session_established = true;
+  return event;
+}
+
 void CryptoModule::free_session(HAPSession *session) {
   if (session == nullptr) {
     return;

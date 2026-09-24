@@ -177,17 +177,18 @@ const char *title = airplay_audio_get_track_title();
 Browse, play-media and announce are deliberately cleared from the feature flags. This is a receiver.
 It plays what a sender pushes to it, and cannot be told to go and fetch a URL.
 
-### Controlling the sender back (DACP)
+### Controlling the sender back (AirPlay 2 events)
 
-The control channel also runs the other way. When a sender identifies itself with an `Active-Remote`
-header (iOS and macOS always do), the receiver gains a DACP client: with a session live,
-`media_player.toggle` (play/pause), `.volume_set`, `.volume_up`, and `.volume_down` are forwarded to
-the sender's control server (port 3689), so a button on the box changes the phone too. Absolute
-volume uses Shairport Sync's proven `setproperty?dmcp.device-volume=<dB>` endpoint; the HA slider
-maps linearly to AirPlay's `-30..0 dB` range. Volume changes update local output first, then send
-DACP best-effort; the sender's `SET_PARAMETER` echo reconciles
-the HA slider. Explicit play/pause/stop and mute remain local. With no live session, toggle also
-falls back to local behaviour.
+Modern encrypted AirPlay 2 uses the event connection advertised in SETUP, not DACP headers. The
+receiver captures `groupUUID`, accepts the sender only on that event port, and creates independent
+`Events-Write`/`Events-Read` cipher state. After encrypted `updateInfo`, `.toggle` sends
+`modernMediaRemoteCommand=2`; `.volume_set`, `.volume_up`, and `.volume_down` send the unit-volume
+`dvlc` command. Thus physical controls update local audio first and then update the phone's own
+controls. The sender's RTSP volume/playback events remain authoritative and reconcile the entity.
+
+DACP (`Active-Remote` on port 3689) remains a best-effort fallback for older senders. Explicit
+play/pause/stop and mute stay local; with neither reverse channel live, toggle also falls back to
+local behaviour.
 
 This is what `examples/buttons.yaml` wires physical buttons to — no extra YAML keys, the
 `media_player` entity is the whole surface.

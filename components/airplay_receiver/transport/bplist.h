@@ -70,7 +70,11 @@ size_t bplist_build_stream_setup(uint8_t *out, size_t capacity, int64_t stream_t
 size_t bplist_build_feedback_response(uint8_t *out, size_t capacity, int64_t stream_type, double sample_rate);
 size_t bplist_build_info_response(uint8_t *out, size_t capacity, const char *device_id,
                                   const char *device_name, const uint8_t *public_key, size_t public_key_len,
-                                  uint64_t features, int64_t protocol_version);
+                                  uint64_t features, int64_t protocol_version,
+                                  const char *event_group = nullptr);
+/// AP2 reverse events: command 2 = play/pause; volume is a unit value (0..1).
+size_t bplist_build_event_command(uint8_t *out, size_t capacity, const char *group_id, const char *command_id);
+size_t bplist_build_event_volume(uint8_t *out, size_t capacity, double volume);
 
 }  // namespace airplay_receiver
 }  // namespace esphome

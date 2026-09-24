@@ -6,6 +6,7 @@
 #include <string>
 
 #include "timing/ptp_clock.h"
+#include "transport/ap2_events.h"
 #include "transport/dacp.h"
 
 #include "esphome/components/network/util.h"
@@ -343,10 +344,12 @@ void AirPlayReceiver::control(const media_player::MediaPlayerCall &call) {
       this->cached_volume_ = this->volume;
       this->publish_state();
 
-      // HA and AirPlay both expose a normalized -30..0 dB slider; the audio
-      // driver gets the matching squared Q15 gain above.
-      dacp_set_volume(AIRPLAY_MIN_VOLUME_DB +
-                      (AIRPLAY_MAX_VOLUME_DB - AIRPLAY_MIN_VOLUME_DB) * local_volume);
+      // Modern iOS receives dvlc on the encrypted AP2 event channel. Retain
+      // DACP's Shairport-compatible dB endpoint for legacy senders only.
+      if (!ap2_events_volume(local_volume)) {
+        dacp_set_volume(AIRPLAY_MIN_VOLUME_DB +
+                        (AIRPLAY_MAX_VOLUME_DB - AIRPLAY_MIN_VOLUME_DB) * local_volume);
+      }
     } else {
       ESP_LOGW(TAG, "Ignoring non-finite media-player volume");
     }
@@ -357,11 +360,10 @@ void AirPlayReceiver::control(const media_player::MediaPlayerCall &call) {
     return;
   }
 
-  // The proven iPhone DACP surface is a sender-owned play/pause toggle plus
-  // blind volume steps. Do not predict state after queuing a toggle: the
-  // sender's RTSP event is authoritative.
+  // AP2 reverse events are primary; DACP is a legacy fallback. Do not predict
+  // state after queuing a toggle: the sender's RTSP event is authoritative.
   if (command.value() == media_player::MEDIA_PLAYER_COMMAND_TOGGLE &&
-      dacp_send(DacpCommand::PLAY_PAUSE)) {
+      (ap2_events_play_pause() || dacp_send(DacpCommand::PLAY_PAUSE))) {
     return;
   }
 
@@ -402,7 +404,9 @@ void AirPlayReceiver::control(const media_player::MediaPlayerCall &call) {
       airplay_audio_set_volume(media_player_volume_to_audio_percent(v));
       this->volume = v;
       this->cached_volume_ = v;
-      dacp_send(DacpCommand::VOLUME_UP);
+      if (!ap2_events_volume(v)) {
+        dacp_send(DacpCommand::VOLUME_UP);
+      }
       break;
     }
     case media_player::MEDIA_PLAYER_COMMAND_VOLUME_DOWN: {
@@ -410,7 +414,9 @@ void AirPlayReceiver::control(const media_player::MediaPlayerCall &call) {
       airplay_audio_set_volume(media_player_volume_to_audio_percent(v));
       this->volume = v;
       this->cached_volume_ = v;
-      dacp_send(DacpCommand::VOLUME_DOWN);
+      if (!ap2_events_volume(v)) {
+        dacp_send(DacpCommand::VOLUME_DOWN);
+      }
       break;
     }
     case media_player::MEDIA_PLAYER_COMMAND_TURN_ON:

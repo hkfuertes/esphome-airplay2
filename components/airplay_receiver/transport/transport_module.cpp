@@ -4,12 +4,12 @@
 // AirPlay 2 control methods, drives the CryptoModule for PAIR-SETUP/PAIR-VERIFY,
 // and hands fully-configured streams to the audio engine via transport events.
 #include "transport_module.h"
+#include "ap2_events.h"
 #include "dacp.h"
 #include "rtsp_message.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <strings.h>
@@ -54,9 +54,6 @@ static const char *const TAG = "airplay_transport";
 #define RTSP_HEADER_IDLE_TIMEOUT_US ((int64_t)10 * 1000 * 1000)
 #define RTSP_CLIENT_STACK_SIZE 8192
 #define RTSP_SERVER_STACK_SIZE 4096
-#define RTSP_EVENT_STACK_SIZE 4096
-// How long event_port_task() sleeps between non-blocking accept() attempts.
-#define EVENT_ACCEPT_POLL_MS 100
 #define RTSP_AP2_AUDIO_BUFFER_SIZE (512 * 1024)        // buffered (type 103) TCP pre-fill
 #define RTSP_AP2_REALTIME_AUDIO_BUFFER_SIZE (1 * 1024 * 1024)  // realtime (type 96) UDP
 
@@ -82,12 +79,6 @@ static int current_slot = 0;
 
 // Forward-declared (defined below after method handlers).
 int rtsp_dispatch(int socket, RtspConn *conn, const uint8_t *raw_request, size_t raw_len);
-
-// Event port (AirPlay 2 server->client event socket) state.
-static int event_client_socket = -1;
-static int event_listen_socket = -1;
-static TaskHandle_t event_task_handle = nullptr;
-static volatile bool event_task_should_stop = false;
 
 // Device info for /info + pairing (fixed buffer — keeps ALL transport heap on
 // the airplay_* path; never a std::string).
@@ -170,11 +161,8 @@ static uint16_t alloc_stream_port(bool udp) {
   return port;
 }
 
-// Non-blocking on purpose: event_port_task() must be able to notice
-// event_task_should_stop between accept() attempts. A blocking accept() parks
-// the task forever, and nothing else closes this listener -- one leaked fd and
-// one leaked 4 KB task per AirPlay session, until LWIP runs out of sockets
-// (CONFIG_LWIP_MAX_SOCKETS is 10) and the RTP ports, OTA and the API all fail.
+// Non-blocking so the AP2 event worker can notice shutdown while waiting for
+// the sender's authenticated event connection.
 static int create_event_socket(uint16_t *port) { return socket_utils_bind_tcp_listener(0, 1, true, port); }
 
 // ===========================================================================
@@ -185,102 +173,6 @@ static void format_time_mmss(uint32_t seconds, char *out, size_t out_size) {
   uint32_t mins = seconds / 60;
   uint32_t secs = seconds % 60;
   snprintf(out, out_size, "%" PRIu32 ":%02" PRIu32, mins, secs);
-}
-
-// ===========================================================================
-// Event port task — accepts the iOS event connection and tracks liveness.
-// ===========================================================================
-static void event_port_task(void *pv) {
-  int listen_socket = (int)(intptr_t)pv;
-  event_listen_socket = listen_socket;
-
-  while (!event_task_should_stop && listen_socket >= 0) {
-    struct sockaddr_in client_addr;
-    socklen_t addr_len = sizeof(client_addr);
-    int client = accept(listen_socket, (struct sockaddr *)&client_addr, &addr_len);
-    if (client < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        vTaskDelay(pdMS_TO_TICKS(EVENT_ACCEPT_POLL_MS));
-        continue;
-      }
-      if (!event_task_should_stop) {
-        ESP_LOGE(TAG, "Event port accept error: %d", errno);
-      }
-      break;
-    }
-    // The listener is non-blocking; the client connection is not. The liveness
-    // loop below relies on recv() parking until iOS drops the connection, and
-    // on stop_event_port_task()'s shutdown() to break it out.
-    int client_flags = fcntl(client, F_GETFL, 0);
-    if (client_flags >= 0) {
-      fcntl(client, F_SETFL, client_flags & ~O_NONBLOCK);
-    }
-    if (event_client_socket >= 0) {
-      close(event_client_socket);
-    }
-    event_client_socket = client;
-    ESP_LOGI(TAG, "Event client connected");
-    transport_events_emit(TRANSPORT_EVENT_CLIENT_CONNECTED, nullptr);
-
-    // Monitor the connection until it drops or we stop.
-    while (!event_task_should_stop) {
-      char buf[16];
-      ssize_t n = recv(event_client_socket, buf, sizeof(buf), MSG_PEEK);
-      if (n <= 0) {
-        if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
-          break;
-        }
-      }
-      vTaskDelay(pdMS_TO_TICKS(200));
-    }
-    if (event_client_socket >= 0) {
-      close(event_client_socket);
-      event_client_socket = -1;
-    }
-  }
-
-  if (event_client_socket >= 0) {
-    close(event_client_socket);
-    event_client_socket = -1;
-  }
-  // The task owns the listener from start_event_port_task() onwards -- the
-  // SETUP path drops its copy of the fd without closing it.
-  close(listen_socket);
-  event_listen_socket = -1;
-  event_task_handle = nullptr;
-  vTaskDelete(nullptr);
-}
-
-static esp_err_t start_event_port_task(int listen_socket) {
-  if (event_task_handle != nullptr) {
-    return ESP_ERR_INVALID_STATE;
-  }
-  event_task_should_stop = false;
-  BaseType_t ret = xTaskCreate(event_port_task, "airplay_event", RTSP_EVENT_STACK_SIZE,
-                               (void *)(intptr_t)listen_socket, 5, &event_task_handle);
-  if (ret != pdPASS) {
-    event_task_handle = nullptr;
-    ESP_LOGE(TAG, "Failed to create event port task");
-    return ESP_FAIL;
-  }
-  return ESP_OK;
-}
-
-static void stop_event_port_task() {
-  if (event_task_handle == nullptr) {
-    return;
-  }
-  event_task_should_stop = true;
-  if (event_client_socket >= 0) {
-    shutdown(event_client_socket, SHUT_RDWR);
-  }
-  int timeout = 20;
-  while (event_task_handle != nullptr && timeout-- > 0) {
-    vTaskDelay(pdMS_TO_TICKS(50));
-  }
-  if (event_task_handle != nullptr) {
-    ESP_LOGW(TAG, "Event port task did not exit within timeout");
-  }
 }
 
 // ===========================================================================
@@ -490,8 +382,8 @@ cleanup:
   // signal_old_client_stop() shuts the socket and creates the new task
   // immediately, so this cleanup can land after the new session has finished
   // SETUP/RECORD and started audio. Emitting DISCONNECTED then would call
-  // audio_receiver_stop() on the *new* session, and stop_event_port_task()
-  // would close the event port it just opened -- leaving the sender connected,
+  // audio_receiver_stop() on the *new* session, and ap2_events_stop() would
+  // close the event port it just opened -- leaving the sender connected,
   // metadata flowing, and no sound. That is what a wifi roam reproduces: the
   // old socket is dead but still open, so this task only wakes once the
   // replacement is already live.
@@ -504,7 +396,7 @@ cleanup:
 
   if (!superseded) {
     transport_events_emit(TRANSPORT_EVENT_DISCONNECTED, nullptr);
-    stop_event_port_task();
+    ap2_events_stop();
     // The sender really went away: drop its DACP endpoint too. A superseded
     // task must NOT clear -- its cleanup can land after the replacement
     // session already armed the channel (same rule as the DISCONNECTED guard
@@ -976,16 +868,23 @@ static void handle_setup(int socket, RtspConn *conn, const RtspRequest *req, con
     }
   }
 
-  // Create the event port for AirPlay 2.
+  // Modern AirPlay 2 reverse control arrives over the encrypted event port;
+  // DACP is only a fallback for senders that still expose its legacy headers.
   if (!is_v1_transport_setup && conn->event_port == 0) {
+    char group_id[65] = {};
+    if (is_bplist) {
+      bplist_find_string(body, body_len, "groupUUID", group_id, sizeof(group_id));
+    }
     conn->event_socket = create_event_socket(&conn->event_port);
     if (conn->event_socket >= 0) {
-      if (start_event_port_task(conn->event_socket) == ESP_OK) {
-        ESP_LOGI(TAG, "SETUP: Created event port %u", conn->event_port);
+      if (ap2_events_start(conn->event_socket, *conn, group_id, s_device_name)) {
+        conn->event_socket = -1;  // ownership moved to ap2_events
+        ESP_LOGI(TAG, "SETUP: Created AP2 event port %u", conn->event_port);
       } else {
         close(conn->event_socket);
         conn->event_socket = -1;
         conn->event_port = 0;
+        ESP_LOGW(TAG, "SETUP: AP2 reverse event channel unavailable");
       }
     }
   }
@@ -1653,7 +1552,7 @@ void AirPlay2Transport::stop() {
     close(server_socket);
     server_socket = -1;
   }
-  stop_event_port_task();
+  ap2_events_stop();
   int timeout = 40;
   while (server_task_handle != nullptr && timeout-- > 0) {
     vTaskDelay(pdMS_TO_TICKS(50));

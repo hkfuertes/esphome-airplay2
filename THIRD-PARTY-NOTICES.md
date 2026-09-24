@@ -16,6 +16,14 @@ term that governs the repository as a whole.
 AirPlay 1 / RAOP (RSA auth, the FairPlay handshake, AES-CBC audio encryption), Bluetooth A2DP and
 the SPDIF/USB outputs were not ported.
 
+### Shairport Sync AP2 reverse events
+
+`components/airplay_receiver/transport/ap2_events.cpp` and the AP2 reverse-event
+binary-plist encoders in `transport/bplist.cpp` follow Shairport Sync upstream commit
+[`441988ce9763062b3fe95c9fd9971ddd457e2466`](https://github.com/mikebrady/shairport-sync/commit/441988ce9763062b3fe95c9fd9971ddd457e2466),
+via the `shairport-echo` patch cited there. Copyright (c) 2014-2026 Mike Brady and
+contributors; its permission notice is retained in [licenses/shairport-events.txt](licenses/shairport-events.txt).
+
 ### David Bryant's sinc resampler
 
 `components/airplay_receiver/audio/audio_resample.cpp` vendors the fixed-ratio sinc resampler from
