@@ -181,12 +181,13 @@ It plays what a sender pushes to it, and cannot be told to go and fetch a URL.
 
 The control channel also runs the other way. When a sender identifies itself with an `Active-Remote`
 header (iOS and macOS always do), the receiver gains a DACP client: with a session live,
-`media_player.toggle`, `.play`, `.pause`, `.stop`, `.volume_up` and `.volume_down` are forwarded to
-the sender's own control server (port 3689), so a button on the box moves the phone's lock screen
-and volume slider with it. The sender echoes the resulting volume over `SET_PARAMETER`, which keeps
-the HA slider honest. Mute stays local: it silences what is playing on this box (the phone-rings
-case) rather than changing the sender for everyone. With no session live the same commands fall
-back to local behaviour.
+`media_player.toggle` (play/pause), `.volume_set`, `.volume_up`, and `.volume_down` are forwarded to
+the sender's control server (port 3689), so a button on the box changes the phone too. Absolute
+volume uses Shairport Sync's proven `setproperty?dmcp.device-volume=<dB>` endpoint; the HA slider
+maps linearly to AirPlay's `-30..0 dB` range. Volume changes update local output first, then send
+DACP best-effort; the sender's `SET_PARAMETER` echo reconciles
+the HA slider. Explicit play/pause/stop and mute remain local. With no live session, toggle also
+falls back to local behaviour.
 
 This is what `examples/buttons.yaml` wires physical buttons to — no extra YAML keys, the
 `media_player` entity is the whole surface.

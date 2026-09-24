@@ -10,9 +10,10 @@
 //
 // ponytail: sender address = the RTSP peer IP + fixed port 3689 (what iOS and
 // macOS listen on); an mDNS browse of _dacp._tcp only matters for exotic
-// relays. Volume is blind-stepped (volumeup/volumedown) -- the sender echoes
-// the resulting level back over SET_PARAMETER volume, so the local entity
-// converges without a round-trip query.
+// relays. Volume steps are blind (volumeup/volumedown); absolute volume uses
+// Shairport's proven setproperty?dmcp.device-volume=<dB> path. The sender
+// echoes the resulting level back over SET_PARAMETER volume, so the local
+// entity converges without a round-trip query.
 
 #include <cstddef>
 #include <cstdint>
@@ -22,11 +23,9 @@ namespace airplay_receiver {
 
 enum class DacpCommand : uint8_t {
   PLAY_PAUSE,
-  PLAY,
-  PAUSE,
-  STOP,
   VOLUME_UP,
   VOLUME_DOWN,
+  SET_DEVICE_VOLUME,
 };
 
 /// Remember the live session's DACP endpoint (peer IP + Active-Remote token).
@@ -39,10 +38,13 @@ void dacp_session_clear();
 /// True while a session with an Active-Remote identity is live.
 bool dacp_available();
 
-/// Queue a command for the sender. False = no session or queue full.
+/// Queue a static command for the sender. False = no session or queue full.
 /// Returns as soon as the command is queued; the HTTP round-trip happens on
 /// the DACP task (never on the caller, never on the RTSP task).
 bool dacp_send(DacpCommand cmd);
+
+/// Queue an absolute AirPlay volume in dB (-30.0 = mute, 0.0 = full scale).
+bool dacp_set_volume(float volume_db);
 
 }  // namespace airplay_receiver
 }  // namespace esphome

@@ -335,13 +335,19 @@ static void process_rtsp_buffer(ClientSlot *slot, uint8_t *buffer, size_t *buf_l
     // Null-terminate the message boundary so header parsers cannot over-read.
     uint8_t saved = buffer[total_len];
     buffer[total_len] = '\0';
-    // Arm the ESP32->sender control channel the first time the sender shows
-    // its DACP identity. header_str is the headers-only NUL-terminated view,
-    // so the search cannot wander into a binary body.
-    if (slot->conn->active_remote[0] == '\0' &&
-        rtsp_parse_active_remote(header_str, slot->conn->active_remote, sizeof(slot->conn->active_remote))) {
-      dacp_session_set(slot->conn->client_ip, slot->conn->active_remote);
-      ESP_LOGI(TAG, "DACP sender armed (Active-Remote: %s)", slot->conn->active_remote);
+    // The sender can refresh Active-Remote mid-session. Keep the DACP endpoint
+    // aligned with its latest RTSP identity; header_str is headers-only, so the
+    // parser cannot wander into a binary body.
+    char active_remote[sizeof(slot->conn->active_remote)] = {};
+    if (rtsp_parse_active_remote(header_str, active_remote, sizeof(active_remote)) &&
+        std::strcmp(active_remote, slot->conn->active_remote) != 0) {
+      if (dacp_session_set(slot->conn->client_ip, active_remote)) {
+        std::strncpy(slot->conn->active_remote, active_remote, sizeof(slot->conn->active_remote) - 1);
+        slot->conn->active_remote[sizeof(slot->conn->active_remote) - 1] = '\0';
+        ESP_LOGI(TAG, "DACP sender control armed");
+      } else {
+        ESP_LOGW(TAG, "Cannot arm DACP sender control");
+      }
     }
     rtsp_dispatch(slot->socket, slot->conn, buffer, total_len);
     buffer[total_len] = saved;

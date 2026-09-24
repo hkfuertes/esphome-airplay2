@@ -174,15 +174,17 @@ media_player has no title/artist fields, so the title is held here and logged).
 
 ## ESP32 -> sender control (DACP, `transport/dacp.{h,cpp}`)
 A sender that puts `Active-Remote` on its RTSP requests (iOS/macOS always do) is running a DACP
-server on port 3689. The receiver captures the header (first request, headers-only buffer in
-`process_rtsp_buffer`), remembers the endpoint, and forwards media_player commands to it:
-`toggle/play/pause/stop/volume_up/volume_down` become `GET /ctrl-int/1/<cmd>` on a dedicated task
-(queue depth 4, non-blocking connect, 1.5 s timeout — a vanished phone cannot wedge anything).
-No session, or DACP unavailable -> the same commands fall back to local behaviour. Volume is
-blind-stepped on the sender and converges via its `SET_PARAMETER` echo, which
-`TRANSPORT_EVENT_VOLUME` mirrors into the entity. MUTE/UNMUTE stay local by design. The endpoint is
-cleared only on a real disconnect — never on a superseded-slot cleanup, same rule as the
-`DISCONNECTED` guard (FIELD-NOTES failure 2).
+server on port 3689. The receiver captures a changed header from any request (headers-only buffer
+in `process_rtsp_buffer`), remembers the endpoint, and forwards `toggle/volume_up/volume_down` as
+`GET /ctrl-int/1/<cmd>` on a dedicated task (queue depth 8, non-blocking connect with a 1.5 s
+timeout and `SO_ERROR` validation — a vanished phone cannot wedge anything). `volume_set` uses
+Shairport Sync's proven `GET /ctrl-int/1/setproperty?dmcp.device-volume=<dB>` endpoint; the HA
+slider maps linearly to AirPlay's `-30..0 dB` range. Toggle falls back to local behaviour when DACP
+is unavailable. Volume changes always update local output
+first, then send DACP best-effort; the sender's `SET_PARAMETER` echo converges
+`TRANSPORT_EVENT_VOLUME` back into the entity. Explicit play/pause/stop and MUTE/UNMUTE stay local.
+The endpoint is cleared only on a real disconnect — never on a superseded-slot cleanup, same rule
+as the `DISCONNECTED` guard (FIELD-NOTES failure 2).
 
 ## Pitfalls / gotchas (already handled, don't regress)
 - **`api:` must not enable `encryption:`.** It pulls `esphome/noise-c`, which brings its own

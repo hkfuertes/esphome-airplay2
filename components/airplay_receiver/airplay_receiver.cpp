@@ -16,6 +16,21 @@ namespace esphome {
 namespace airplay_receiver {
 
 static const char *const TAG = "airplay_receiver";
+constexpr float AIRPLAY_MIN_VOLUME_DB = -30.0f;
+constexpr float AIRPLAY_MAX_VOLUME_DB = 0.0f;
+
+uint8_t media_player_volume_to_audio_percent(float level) {
+  const float clamped = std::clamp(level, 0.0f, 1.0f);
+  return static_cast<uint8_t>(std::round(clamped * clamped * 100.0f));
+}
+
+float airplay_db_to_media_player_volume(float volume_db) {
+  if (!std::isfinite(volume_db)) {
+    return 0.0f;
+  }
+  return std::clamp((volume_db - AIRPLAY_MIN_VOLUME_DB) / (AIRPLAY_MAX_VOLUME_DB - AIRPLAY_MIN_VOLUME_DB), 0.0f,
+                    1.0f);
+}
 
 void AirPlayReceiver::setup() {
   // The entity name (config `name:`, from the media_player schema) is the user
@@ -319,13 +334,22 @@ media_player::MediaPlayerTraits AirPlayReceiver::get_traits() {
 }
 
 void AirPlayReceiver::control(const media_player::MediaPlayerCall &call) {
-  // Ha volume (0.0-1.0) -> audio engine percent (0-100).
+  // HA volume is AirPlay's normalized -30..0 dB slider; map it to Q15 percent.
   if (auto volume = call.get_volume(); volume.has_value()) {
-    uint8_t vol_pct = static_cast<uint8_t>(std::round(volume.value() * 100.0f));
-    airplay_audio_set_volume(vol_pct);
-    this->volume = volume.value();
-    this->cached_volume_ = this->volume;
-    this->publish_state();
+    if (std::isfinite(volume.value())) {
+      const float local_volume = std::clamp(volume.value(), 0.0f, 1.0f);
+      airplay_audio_set_volume(media_player_volume_to_audio_percent(local_volume));
+      this->volume = local_volume;
+      this->cached_volume_ = this->volume;
+      this->publish_state();
+
+      // HA and AirPlay both expose a normalized -30..0 dB slider; the audio
+      // driver gets the matching squared Q15 gain above.
+      dacp_set_volume(AIRPLAY_MIN_VOLUME_DB +
+                      (AIRPLAY_MAX_VOLUME_DB - AIRPLAY_MIN_VOLUME_DB) * local_volume);
+    } else {
+      ESP_LOGW(TAG, "Ignoring non-finite media-player volume");
+    }
   }
 
   auto command = call.get_command();
@@ -333,63 +357,11 @@ void AirPlayReceiver::control(const media_player::MediaPlayerCall &call) {
     return;
   }
 
-  // ESP32 -> sender channel: with a live session that exposed an
-  // Active-Remote identity, drive the sender itself over DACP, so the phone's
-  // lock screen and volume slider follow the box. The sender confirms with
-  // its own events (PLAYING/PAUSED, SET_PARAMETER volume); volume is
-  // deliberately not stepped locally here -- the sender echoes the new level
-  // and TRANSPORT_EVENT_VOLUME mirrors it below. MUTE/UNMUTE stay local on
-  // purpose: they mute what is playing HERE (the phone-rings case), while
-  // DACP mute would change the sender for everyone listening.
-  DacpCommand dacp_cmd;
-  bool via_dacp = false;
-  switch (command.value()) {
-    case media_player::MEDIA_PLAYER_COMMAND_TOGGLE:
-      dacp_cmd = DacpCommand::PLAY_PAUSE;
-      via_dacp = true;
-      break;
-    case media_player::MEDIA_PLAYER_COMMAND_PLAY:
-      dacp_cmd = DacpCommand::PLAY;
-      via_dacp = true;
-      break;
-    case media_player::MEDIA_PLAYER_COMMAND_PAUSE:
-      dacp_cmd = DacpCommand::PAUSE;
-      via_dacp = true;
-      break;
-    case media_player::MEDIA_PLAYER_COMMAND_STOP:
-      dacp_cmd = DacpCommand::STOP;
-      via_dacp = true;
-      break;
-    case media_player::MEDIA_PLAYER_COMMAND_VOLUME_UP:
-      dacp_cmd = DacpCommand::VOLUME_UP;
-      via_dacp = true;
-      break;
-    case media_player::MEDIA_PLAYER_COMMAND_VOLUME_DOWN:
-      dacp_cmd = DacpCommand::VOLUME_DOWN;
-      via_dacp = true;
-      break;
-    default:
-      break;
-  }
-  if (via_dacp && dacp_send(dacp_cmd)) {
-    // Optimistic state; the sender's own events will correct it within a beat.
-    switch (command.value()) {
-      case media_player::MEDIA_PLAYER_COMMAND_PLAY:
-        this->desired_state_ = media_player::MEDIA_PLAYER_STATE_PLAYING;
-        this->state_dirty_ = true;
-        break;
-      case media_player::MEDIA_PLAYER_COMMAND_PAUSE:
-        this->desired_state_ = media_player::MEDIA_PLAYER_STATE_PAUSED;
-        this->state_dirty_ = true;
-        break;
-      case media_player::MEDIA_PLAYER_COMMAND_STOP:
-        this->desired_state_ = media_player::MEDIA_PLAYER_STATE_IDLE;
-        this->state_dirty_ = true;
-        break;
-      default:
-        break;
-    }
-    this->publish_state();
+  // The proven iPhone DACP surface is a sender-owned play/pause toggle plus
+  // blind volume steps. Do not predict state after queuing a toggle: the
+  // sender's RTSP event is authoritative.
+  if (command.value() == media_player::MEDIA_PLAYER_COMMAND_TOGGLE &&
+      dacp_send(DacpCommand::PLAY_PAUSE)) {
     return;
   }
 
@@ -423,20 +395,22 @@ void AirPlayReceiver::control(const media_player::MediaPlayerCall &call) {
       break;
     case media_player::MEDIA_PLAYER_COMMAND_UNMUTE:
       this->muted_ = false;
-      airplay_audio_set_volume(static_cast<uint8_t>(std::round(this->cached_volume_ * 100.0f)));
+      airplay_audio_set_volume(media_player_volume_to_audio_percent(this->cached_volume_));
       break;
     case media_player::MEDIA_PLAYER_COMMAND_VOLUME_UP: {
       float v = std::min(1.0f, this->volume + 0.05f);
-      airplay_audio_set_volume(static_cast<uint8_t>(std::round(v * 100.0f)));
+      airplay_audio_set_volume(media_player_volume_to_audio_percent(v));
       this->volume = v;
       this->cached_volume_ = v;
+      dacp_send(DacpCommand::VOLUME_UP);
       break;
     }
     case media_player::MEDIA_PLAYER_COMMAND_VOLUME_DOWN: {
       float v = std::max(0.0f, this->volume - 0.05f);
-      airplay_audio_set_volume(static_cast<uint8_t>(std::round(v * 100.0f)));
+      airplay_audio_set_volume(media_player_volume_to_audio_percent(v));
       this->volume = v;
       this->cached_volume_ = v;
+      dacp_send(DacpCommand::VOLUME_DOWN);
       break;
     }
     case media_player::MEDIA_PLAYER_COMMAND_TURN_ON:
@@ -536,9 +510,9 @@ void AirPlayReceiver::handle_transport_event(TransportEvent event, const Transpo
       break;
     case TRANSPORT_EVENT_VOLUME: {
       audio_output_set_volume_q15(transport_volume_q15());
-      // Mirror the sender's level into the entity: this is how DACP volume
-      // steps and sender-side slider moves reach the HA card. Q15: 32768 = 1.0.
-      this->volume = static_cast<float>(transport_volume_q15()) / 32768.0f;
+      // Mirror AirPlay's -30..0 dB slider into HA. Q15 is the audio gain
+      // curve, not the sender's UI scale.
+      this->volume = airplay_db_to_media_player_volume(transport_volume_db());
       this->cached_volume_ = this->volume;
       this->state_dirty_ = true;
       break;
