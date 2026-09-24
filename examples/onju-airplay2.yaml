@@ -9,10 +9,6 @@ esphome:
   name: ${name}
   friendly_name: ${friendly}
   min_version: 2026.4.0
-  on_boot:
-    priority: -100
-    then:
-      - script.execute: update_led
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -65,6 +61,18 @@ airplay_receiver:
   audio_channel_mode: mono
   sample_rate: 44100
   buffer_size: 8000
+  on_state:
+    - if:
+        condition:
+          lambda: |-
+            // Ignore the initial state and playback-only updates.
+            static float previous = id(airplay).volume;
+            const float current = id(airplay).volume;
+            const bool changed = current != previous;
+            previous = current;
+            return changed;
+        then:
+          - script.execute: show_volume
   dsp:
     preamp: 6dB
     filters:
@@ -72,7 +80,7 @@ airplay_receiver:
         frequency: 120Hz
         q: 0.7
 
-# --- LEDs (6x SK6812: 0 = izquierdo, 1-4 = arriba, 5 = derecho) ---
+# --- Volumen: barra blanca en los LEDs 1-4; laterales 0 y 5 apagados ---
 light:
   - platform: esp32_rmt_led_strip
     id: leds
@@ -85,17 +93,9 @@ light:
     internal: true
 
   - platform: partition
-    id: left_led
-    internal: true
-    segments:
-      - id: leds
-        from: 0
-        to: 0
-
-  - platform: partition
     id: top_led
     internal: true
-    default_transition_length: 300ms
+    default_transition_length: 0s
     segments:
       - id: leds
         from: 1
@@ -114,17 +114,9 @@ light:
                 uint8_t b = (uint8_t) ((v - full) * 255);
                 it[i] = Color(b, b, b);
               } else {
-                it[i] = Color(15, 15, 15);
+                it[i] = Color::BLACK;
               }
             }
-
-  - platform: partition
-    id: right_led
-    internal: true
-    segments:
-      - id: leds
-        from: 5
-        to: 5
 
 # --- Botones táctiles e interruptor de mute ---
 esp32_touch:
@@ -144,16 +136,9 @@ binary_sensor:
       - delayed_on: 25ms
       - delayed_off: 25ms
     on_press:
-      - light.turn_on:
-          id: right_led
-          brightness: 60%
-          red: 100%
-          green: 100%
-          blue: 100%
       - script.execute: volume_up_repeat
     on_release:
       - script.stop: volume_up_repeat
-      - light.turn_off: right_led
 
   - platform: esp32_touch
     id: touch_vol_down
@@ -163,16 +148,9 @@ binary_sensor:
       - delayed_on: 25ms
       - delayed_off: 25ms
     on_press:
-      - light.turn_on:
-          id: left_led
-          brightness: 60%
-          red: 100%
-          green: 100%
-          blue: 100%
       - script.execute: volume_down_repeat
     on_release:
       - script.stop: volume_down_repeat
-      - light.turn_off: left_led
 
   - platform: esp32_touch
     id: touch_center
@@ -208,20 +186,6 @@ binary_sensor:
     on_release:
       - media_player.unmute: airplay
 
-# --- Interruptor para el brillo al reproducir ---
-switch:
-  - platform: template
-    name: "Playing Light"
-    id: playing_light
-    icon: mdi:led-on
-    entity_category: config
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_ON
-    on_turn_on:
-      - script.execute: update_led
-    on_turn_off:
-      - script.execute: update_led
-
 # --- Ajuste de ganancia desde Home Assistant ---
 number:
   - platform: template
@@ -238,16 +202,9 @@ number:
     on_value:
       - lambda: id(airplay).set_dsp_preamp(x);
 
-# --- Lógica de LEDs ---
-globals:
-  - id: was_playing
-    type: bool
-    restore_value: false
-    initial_value: "false"
-
+# --- Repetición de volumen e indicador ---
 script:
-  # Keep touch repeats cancellable: release stops the delay immediately, so
-  # neither a stale volume step nor a stuck side LED survives a short tap.
+  # Keep touch repeats cancellable: release stops any pending volume step.
   - id: volume_up_repeat
     mode: restart
     then:
@@ -256,7 +213,6 @@ script:
             binary_sensor.is_on: touch_vol_up
           then:
             - media_player.volume_up: airplay
-            - script.execute: show_volume
             - delay: 250ms
 
   - id: volume_down_repeat
@@ -267,7 +223,6 @@ script:
             binary_sensor.is_on: touch_vol_down
           then:
             - media_player.volume_down: airplay
-            - script.execute: show_volume
             - delay: 250ms
 
   - id: show_volume
@@ -278,41 +233,7 @@ script:
           effect: volume
           brightness: 60%
       - delay: 2s
-      - script.execute: update_led
-
-  - id: update_led
-    mode: restart
-    then:
-      - if:
-          condition:
-            lambda: 'return id(show_volume).is_running();'
-          then: []
-          else:
-            - if:
-                condition:
-                  and:
-                    - lambda: 'return id(was_playing);'
-                    - switch.is_on: playing_light
-                then:
-                  - light.turn_on:
-                      id: top_led
-                      effect: None
-                      red: 0%
-                      green: 60%
-                      blue: 100%
-                      brightness: 25%
-                else:
-                  - light.turn_off: top_led
-
-interval:
-  - interval: 500ms
-    then:
-      - lambda: |-
-          bool playing = id(airplay).state == media_player::MediaPlayerState::MEDIA_PLAYER_STATE_PLAYING;
-          if (playing != id(was_playing)) {
-            id(was_playing) = playing;
-            id(update_led).execute();
-          }
+      - light.turn_off: top_led
 
 # --- Diagnóstico ---
 debug:
