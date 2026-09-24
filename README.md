@@ -22,6 +22,7 @@ Home Assistant as a `media_player`.
 - [Diagnostics](#diagnostics)
 - [Examples](examples)
   - [Amped-ESP32-S3](examples/amped-s3.yaml)
+  - [Onju Voice — touch controls and LEDs](examples/onju-airplay2.yaml)
   - [Generic ESP32 + PCM5102A](examples/generic-esp32.yaml)
   - [Speaker correction](examples/dsp-speaker-correction.yaml)
   - [Physical buttons](examples/buttons.yaml)

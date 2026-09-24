@@ -1,0 +1,331 @@
+# Onju Voice — AirPlay 2 receiver with encrypted AP2 reverse controls.
+# Copy secrets.example.yaml to secrets.yaml and fill in Wi-Fi/OTA credentials.
+
+substitutions:
+  name: onju-airplay2
+  friendly: "Onju"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly}
+  min_version: 2026.4.0
+  on_boot:
+    priority: -100
+    then:
+      - script.execute: update_led
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: INFO
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+  ap:
+    ssid: "${friendly} Fallback"
+    password: !secret wifi_password
+
+captive_portal:
+
+# Sin encryption: el componente AirPlay no es compatible con ella
+api:
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+safe_mode:
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/hkfuertes/esphome-airplay2
+      ref: feat/dacp-sender-control
+    components:
+      - airplay_receiver
+
+airplay_receiver:
+  id: airplay
+  name: ${friendly}
+  i2s_bclk_pin: GPIO18
+  i2s_lrclk_pin: GPIO13
+  i2s_dout_pin: GPIO12
+  amp_enable_pin: GPIO21
+  amp_enable_inverted: false
+  audio_channel_mode: mono
+  sample_rate: 44100
+  buffer_size: 8000
+  dsp:
+    preamp: 6dB
+    filters:
+      - type: high_pass
+        frequency: 120Hz
+        q: 0.7
+
+# --- LEDs (6x SK6812: 0 = izquierdo, 1-4 = arriba, 5 = derecho) ---
+light:
+  - platform: esp32_rmt_led_strip
+    id: leds
+    pin: GPIO11
+    chipset: SK6812
+    num_leds: 6
+    channel_colors: GRB
+    default_transition_length: 0s
+    restore_mode: ALWAYS_OFF
+    internal: true
+
+  - platform: partition
+    id: left_led
+    internal: true
+    segments:
+      - id: leds
+        from: 0
+        to: 0
+
+  - platform: partition
+    id: top_led
+    internal: true
+    default_transition_length: 300ms
+    segments:
+      - id: leds
+        from: 1
+        to: 4
+    effects:
+      - addressable_lambda:
+          name: volume
+          update_interval: 50ms
+          lambda: |-
+            float v = id(airplay).volume * it.size();
+            int full = (int) v;
+            for (int i = 0; i < it.size(); i++) {
+              if (i < full) {
+                it[i] = Color::WHITE;
+              } else if (i == full) {
+                uint8_t b = (uint8_t) ((v - full) * 255);
+                it[i] = Color(b, b, b);
+              } else {
+                it[i] = Color(15, 15, 15);
+              }
+            }
+
+  - platform: partition
+    id: right_led
+    internal: true
+    segments:
+      - id: leds
+        from: 5
+        to: 5
+
+# --- Botones táctiles e interruptor de mute ---
+esp32_touch:
+  setup_mode: false
+  measurement_duration: 0.25ms
+  sleep_duration: 2ms
+
+binary_sensor:
+  - platform: status
+    name: "Status"
+
+  - platform: esp32_touch
+    id: touch_vol_up
+    pin: GPIO2
+    threshold: 2000
+    filters:
+      - delayed_on: 25ms
+      - delayed_off: 25ms
+    on_press:
+      - light.turn_on:
+          id: right_led
+          brightness: 60%
+          red: 100%
+          green: 100%
+          blue: 100%
+      - script.execute: volume_up_repeat
+    on_release:
+      - script.stop: volume_up_repeat
+      - light.turn_off: right_led
+
+  - platform: esp32_touch
+    id: touch_vol_down
+    pin: GPIO4
+    threshold: 2000
+    filters:
+      - delayed_on: 25ms
+      - delayed_off: 25ms
+    on_press:
+      - light.turn_on:
+          id: left_led
+          brightness: 60%
+          red: 100%
+          green: 100%
+          blue: 100%
+      - script.execute: volume_down_repeat
+    on_release:
+      - script.stop: volume_down_repeat
+      - light.turn_off: left_led
+
+  - platform: esp32_touch
+    id: touch_center
+    pin: GPIO3
+    threshold: 2000
+    filters:
+      - delayed_on: 25ms
+      - delayed_off: 25ms
+    on_click:
+      - min_length: 20ms
+        max_length: 600ms
+        then:
+          - media_player.toggle: airplay
+      - min_length: 800ms
+        max_length: 3s
+        then:
+          - if:
+              condition:
+                media_player.is_muted: airplay
+              then:
+                - media_player.unmute: airplay
+              else:
+                - media_player.mute: airplay
+
+  - platform: gpio
+    id: mute_switch
+    name: "Mute Switch"
+    pin:
+      number: GPIO38
+      mode: INPUT_PULLUP
+    on_press:
+      - media_player.mute: airplay
+    on_release:
+      - media_player.unmute: airplay
+
+# --- Interruptor para el brillo al reproducir ---
+switch:
+  - platform: template
+    name: "Playing Light"
+    id: playing_light
+    icon: mdi:led-on
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - script.execute: update_led
+    on_turn_off:
+      - script.execute: update_led
+
+# --- Ajuste de ganancia desde Home Assistant ---
+number:
+  - platform: template
+    name: "AirPlay Preamp"
+    icon: mdi:volume-plus
+    unit_of_measurement: dB
+    entity_category: config
+    min_value: -6
+    max_value: 12
+    step: 1
+    initial_value: 6
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lambda: id(airplay).set_dsp_preamp(x);
+
+# --- Lógica de LEDs ---
+globals:
+  - id: was_playing
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+script:
+  # Keep touch repeats cancellable: release stops the delay immediately, so
+  # neither a stale volume step nor a stuck side LED survives a short tap.
+  - id: volume_up_repeat
+    mode: restart
+    then:
+      - while:
+          condition:
+            binary_sensor.is_on: touch_vol_up
+          then:
+            - media_player.volume_up: airplay
+            - script.execute: show_volume
+            - delay: 250ms
+
+  - id: volume_down_repeat
+    mode: restart
+    then:
+      - while:
+          condition:
+            binary_sensor.is_on: touch_vol_down
+          then:
+            - media_player.volume_down: airplay
+            - script.execute: show_volume
+            - delay: 250ms
+
+  - id: show_volume
+    mode: restart
+    then:
+      - light.turn_on:
+          id: top_led
+          effect: volume
+          brightness: 60%
+      - delay: 2s
+      - script.execute: update_led
+
+  - id: update_led
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return id(show_volume).is_running();'
+          then: []
+          else:
+            - if:
+                condition:
+                  and:
+                    - lambda: 'return id(was_playing);'
+                    - switch.is_on: playing_light
+                then:
+                  - light.turn_on:
+                      id: top_led
+                      effect: None
+                      red: 0%
+                      green: 60%
+                      blue: 100%
+                      brightness: 25%
+                else:
+                  - light.turn_off: top_led
+
+interval:
+  - interval: 500ms
+    then:
+      - lambda: |-
+          bool playing = id(airplay).state == media_player::MediaPlayerState::MEDIA_PLAYER_STATE_PLAYING;
+          if (playing != id(was_playing)) {
+            id(was_playing) = playing;
+            id(update_led).execute();
+          }
+
+# --- Diagnóstico ---
+debug:
+  update_interval: 30s
+
+sensor:
+  - platform: uptime
+    name: "Uptime"
+    update_interval: 30s
+  - platform: debug
+    free:
+      name: "Free Internal Heap"
+      entity_category: diagnostic
+    psram:
+      name: "Free PSRAM"
+      entity_category: diagnostic
